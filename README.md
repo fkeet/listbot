@@ -11,3 +11,7 @@ Next steps:
 * provide a 'search' function for admin users
 * provide a 'queue' function for admin users
 * find and trigger items from the queue list
+
+Fixme
+* Drop 'seen' list and just use 'waiting' and 'requested' so we can refresh
+  files that expired

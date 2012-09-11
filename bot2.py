@@ -1,4 +1,5 @@
 import irclib
+import string
 import shelve
 import re
 import struct
@@ -6,22 +7,8 @@ import os
 import sys
 import time
 import zipfile
-
-# Connection information
-# network = 'irc.servercentral.net'
-# network = 'irc.paraphysics.net'
-# network = 'eu.undernet.org'
-# network = 'Hollywood.CA.US.Undernet.org'
-network = '208.64.123.210'
-port = 6667
-channel = '#bookz'
-# channel = '#magpietest'
-nick = 'magpie'
-name = 'magpie'
-HAMMER_TIME = 20
-EXPIRE = 60 * 1 * 1  # 15 day cache time
-admin = ['fred__', 'cabel']
-blacklist = ['@seach', '@seek', '@search/@seek']
+import config
+from pprint import pformat
 
 # irclib.DEBUG = True
 
@@ -33,33 +20,61 @@ class dccBot(irclib.SimpleIRCClient):
         self.last_request = 0
         self.waiting = {}
         self.seen = {}
-        if 'requested' in self.persist:
-            self.requested = self.persist['requested']
-        else:
-            self.requested = {}
         self.received = {}
         self.receiving = True
         self.file_list = {}
         self.private = open('private_msgs.txt', 'a')
+        if 'requested' in self.persist:
+            self.requested = self.persist['requested']
+        else:
+            self.requested = {}
+        print "Loaded {} old requested items".format(len(self.requested))
 
     def on_privnotice(self, connection, event):
         if event.source():
             print '\t:: ' + event.source() + ' ->' + event.arguments()[0]
         else:
             print event.arguments()[0]
+
+        if(event.arguments()[0].find('I have added') >= 0 or
+                event.arguments()[0].find('After waiting') >= 0):
+            return
+
         self.private.write("{}\n".format(event.arguments()[0]))
         self.private.flush()
 
     def on_privmsg(self, connection, event):
-        print event.source().split('!')[0] + ': ' + event.arguments()[0]
+        source = event.source().split('!')[0]
+        print source + ': ' + event.arguments()[0]
 
-        if event.target() in admin and event.arguments()[0].startswith('.'):
-            connection.privmsg(event.target(),
-                "We are waiting to retrieve these:")
-            message = "{}".format(self.waiting)
-            connection.privmsg(event.target(), message)
-        if event.arguments()[0].lower().find('hello') == 0:
-            connection.privmsg(event.source().split('!')[0], 'Hello.')
+        if source in config.admin and event.arguments()[0].startswith('.'):
+            message = "We are waiting to retrieve these:\n{}".format(
+                pformat(self.waiting))
+            print message
+            connection.privmsg(source, "{} Waiting".format(len(self.waiting)))
+            message = "List of requests:\n{}".format(pformat(self.requested))
+            print message
+            connection.privmsg(source, "{} Requested".format(
+                len(self.requested)))
+            min_val = time.time()
+            next_key = None
+            next_item = None
+            for key in self.requested:
+                if self.requested[key]['date'] < min_val:
+                    next_item = self.requested[key]
+                    next_key = key
+                    min_val = self.requested[key]['date']
+            print next_item
+            time_until_next_item = config.EXPIRE - (time.time() - next_item['date'])
+            message = "The next item: {} in {} s".format(
+                    pformat({next_key: next_item}), time_until_next_item)
+            connection.privmsg(source, message)
+        else:
+            print event.arguments()[0].startswith('.')
+            print config.admin
+            print source
+            self.private.write("{}\n".format(event.arguments()[0]))
+            self.private.flush()
 
     def on_pubmsg(self, connection, event):
         line = event.arguments()[0]
@@ -67,37 +82,44 @@ class dccBot(irclib.SimpleIRCClient):
         if list_position > -1:
             # print 'found list word'
             for word in line.split():
-                if word.startswith("@") and word not in blacklist:
-                    # print 'found trigger word'
-                    #if we have not seen this trigger before add it to our list
-                    if word not in self.seen:
-                        self.seen.update(self.make_entry(event, word))
-                        #if we have not requested this trigger before, and
-                        #enough time has elapsed since the last request, or the
-                        # last request is too far back, request it
-                        if self.may_trigger_next(word):
-                            # if word in self.requested:
-                                # print "Last update {}".\
-                                #         format(time.time() - EXPIRE
-                                #         - self.requested[word]['date'])
-                            self.last_request = time.time()
-                            print "Sending trigger '{}' to '{}'".format(word,
-                                event.target())
-                            connection.privmsg(event.target(), word)
-                            self.requested.update(self.make_entry(event, word))
-                            self.persist['requested'] = self.requested
-                            self.persist.sync()
-                            # print "Persisted request {}".format(self.requested)
-                        else:
-                            # print time.time()-self.last_request > HAMMER_TIME
-                            # print word not in self.requested
-                            # if word in self.requested:
-                            #     print(time.time() - EXPIRE - self.requested[word]['date'])
-                            self.waiting.update(self.make_entry(event, word))
-                            print "\tQueing trigger {}: {}".format(word, self.waiting)
-                            # print self.waiting
-                    # else:
-                    #     print "but i've seen it before"
+                if '@' in word:
+                    word = filter(lambda x: x in string.letters or x in ['@'], word)
+                    if word.startswith("@") and word not in config.blacklist:
+                        # print 'found trigger word'
+                        #if we have not seen this trigger before add it to our list
+                        if word not in self.seen:
+                            self.seen.update(self.make_entry(event, word))
+                            #if we have not requested this trigger before, and
+                            #enough time has elapsed since the last request, or the
+                            # last request is too far back, request it
+                            if self.may_trigger_next(word):
+                                # if word in self.requested:
+                                    # print "Last update {}".\
+                                    #         format(time.time() - EXPIRE
+                                    #         - self.requested[word]['date'])
+                                self.last_request = time.time()
+                                print "Sending trigger '{}' to '{}'".format(word,
+                                    event.target())
+                                connection.privmsg(event.target(), word)
+                                self.requested.update(self.make_entry(event, word))
+                                self.persist['requested'] = self.requested
+                                self.persist.sync()
+                                # print "Persisted request {}".format(self.requested)
+                            else:
+                                # print time.time()-self.last_request > HAMMER_TIME
+                                # print word not in self.requested
+                                # if word in self.requested:
+                                #     print(time.time() - EXPIRE - self.requested[word]['date'])
+                                self.waiting.update(self.make_entry(event, word))
+                                print "\tQueing trigger {}: {}".format(word, self.waiting)
+                                # print self.waiting
+                        # else:
+                        #     print "but i've seen it before"
+                    else:
+                        unmatched_word = open('unmatched.txt', 'a')
+                        unmatched_word.write("{}\n".format(word))
+                        unmatched_word.close()
+
         else:
             # print "not list advert, waiting has length of {}".format(len(self.waiting))
             # print time.time() - self.last_request - HAMMER_TIME
@@ -124,10 +146,10 @@ class dccBot(irclib.SimpleIRCClient):
             #print event.target() + '> ' + event.source().split('!')[0] + ': ' + event.arguments()[0]
 
     def may_trigger_next(self, word=None):
-        not_hammering = time.time() - self.last_request > HAMMER_TIME
+        not_hammering = time.time() - self.last_request > config.HAMMER_TIME
         if word is not None:
             expired = word not in self.requested\
-                or time.time() - self.last_request > EXPIRE
+                or time.time() - self.last_request > config.EXPIRE
         else:
             expired = True
         return not_hammering and expired
@@ -215,7 +237,7 @@ class dccBot(irclib.SimpleIRCClient):
                     self.file_list[event.source()]['received_bytes']))
 
     def on_endofmotd(self, connection, event):
-        self.ircobj.connections[0].join(channel)
+        self.ircobj.connections[0].join(config.channel)
 
     def on_quit(self, connection, event):
         # self.private.close()
@@ -229,7 +251,7 @@ class dccBot(irclib.SimpleIRCClient):
 def main():
     connection = dccBot()
     try:
-        connection.connect(network, port, nick)
+        connection.connect(config.network, config.port, config.nick)
     except irclib.ServerConnectionError,  x:
         print x
         sys.exit(1)
