@@ -1,3 +1,8 @@
+=======
+listbot
+=======
+
+IRC list bot
 A Python IRC bot intended for list serv channels. It monitors the list of
 channels for list adverts, and collects the lists.
 
