@@ -10,7 +10,7 @@ import zipfile
 import config
 from pprint import pformat
 
-# irclib.DEBUG = True
+irclib.DEBUG = True
 
 
 class dccBot(irclib.SimpleIRCClient):
