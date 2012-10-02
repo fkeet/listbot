@@ -1,4 +1,6 @@
 import irclib
+import collections
+import signal
 import string
 import shelve
 import re
@@ -9,6 +11,7 @@ import time
 import zipfile
 import config
 from pprint import pformat
+import subprocess
 
 irclib.DEBUG = True
 
@@ -29,6 +32,11 @@ class dccBot(irclib.SimpleIRCClient):
         else:
             self.requested = {}
         print "Loaded {} old requested items".format(len(self.requested))
+        self.motd_counter = 0
+        self.music_files = []
+        self.skip_song_votes = []
+        self.player = None
+        self.queue = collections.deque()
 
     def on_privnotice(self, connection, event):
         if event.source():
@@ -43,32 +51,138 @@ class dccBot(irclib.SimpleIRCClient):
         self.private.write("{}\n".format(event.arguments()[0]))
         self.private.flush()
 
+    def leave_handler(self, event):
+        source = event.source().split('!')[0]
+        self.connection.privmsg(source, 'Bye')
+        self.connection.close()
+
+    def refresh_handler(self, event):
+        for root, subfolders, files in os.walk(config.root_dir):
+            for file in files:
+                filename = os.path.join(root, file)
+                self.music_files.append(filename)
+
+    def ls_handler(self, event):
+        source = event.source().split('!')[0]
+        if len(self.music_files) > 0:
+            search_term = ' '.join(event.arguments()[0].split(' ')[1:])
+            print search_term
+            if len(search_term) > 0:
+                for line in self.music_files:
+                    if line.find(search_term) > -1:
+                        self.connection.privmsg(source, os.path.basename(line))
+                        time.sleep(1)
+            else:
+                self.connection.privmsg(source, 'Syntax: .ls <search term>')
+        else:
+            self.connection.privmsg(source, 'List empty')
+
+    def find_first_result(self, search_term):
+        for line in self.music_files:
+            if line.find(search_term) > -1:
+                return line
+
+    def enqueue_handler(self, event):
+        source = event.source().split('!')[0]
+        item_to_queue = ' '.join(event.arguments()[0].split(' ')[1:])
+        if len(item_to_queue) > 0:
+            if len(self.music_files) > 0:
+                filepath = self.find_first_result(item_to_queue)
+                self.play(filepath)
+            else:
+                self.connection.privmsg(source, 'The list is empty. Try a refresh')
+        else:
+            self.show_queue_handler(event)
+
+    #Random item queuing
+
+    def show_queue_handler(self, event):
+        source = event.source().split('!')[0]
+        if len(self.queue) > 0:
+            ctr = 0
+            for item in self.queue:
+                ctr += 1
+                self.connection.privmsg(source, "{}:{}".format(ctr, os.path.basename(item)))
+        else:
+            self.connection.privmsg(source, 'The queue is empty. Better act fast!')
+
+    def play(self, filepath):
+        if not self.player or self.player.returncode:
+            if filepath in self.music_files:
+                if os.path.isfile(filepath):
+                    self.skip_song_votes = []
+                    self.player = subprocess.Popen([config.player, filepath])
+            else:
+                print self.music_files
+                print filepath
+                for _ in range(1, 9):
+                    print "SOMETHING VERY BAD HAPPENED"
+                    print filepath
+        else:
+            #something is playing TODO queue for next play
+            self.queue.append(filepath)
+
+    def next_handler(self, event):
+        #Add this person to the list of people wanting to skip this song
+        source = event.source().split('!')[0]
+        self.skip_song_votes.append(source)
+        #TODO Use a system of majority to skip a currently playing song
+
+    def stop_handler(self, event):
+        self.player.send_signal(signal.SIGTERM)
+
+    def continue_handler(self, event):
+        print self.player
+        print self.player.returncode
+        self.play(self.queue.pop())
+
+    def help_handler(self, event):
+        source = event.source().split('!')[0]
+        self.connection.privmsg(source, '.h, .leave, .ls, .refresh, .q, .queue, .n, .s, .c')
+
     def on_privmsg(self, connection, event):
         source = event.source().split('!')[0]
         print source + ': ' + event.arguments()[0]
 
+        command_mappings = {
+                '.h': self.help_handler,
+                '.leave': self.leave_handler,
+                '.ls': self.ls_handler,
+                '.refresh': self.refresh_handler,
+                '.q': self.enqueue_handler,
+                '.queue': self.enqueue_handler,
+                '.n': self.next_handler,
+                '.s': self.stop_handler,
+                '.c': self.continue_handler,
+                }
+
         if source in config.admin and event.arguments()[0].startswith('.'):
-            message = "We are waiting to retrieve these:\n{}".format(
-                pformat(self.waiting))
-            print message
-            connection.privmsg(source, "{} Waiting".format(len(self.waiting)))
-            message = "List of requests:\n{}".format(pformat(self.requested))
-            print message
-            connection.privmsg(source, "{} Requested".format(
-                len(self.requested)))
-            min_val = time.time()
-            next_key = None
-            next_item = None
-            for key in self.requested:
-                if self.requested[key]['date'] < min_val:
-                    next_item = self.requested[key]
-                    next_key = key
-                    min_val = self.requested[key]['date']
-            print next_item
-            time_until_next_item = config.EXPIRE - (time.time() - next_item['date'])
-            message = "The next item: {} in {} s".format(
-                    pformat({next_key: next_item}), time_until_next_item)
-            connection.privmsg(source, message)
+            command = event.arguments()[0].split(' ')[0]
+            if command in command_mappings:
+                command_mappings[command](event)
+            else:
+                message = "We are waiting to retrieve these:\n{}".format(
+                    pformat(self.waiting))
+                print message
+                connection.privmsg(source, "{} Waiting".format(len(self.waiting)))
+                message = "List of requests:\n{}".format(pformat(self.requested))
+                print message
+                connection.privmsg(source, "{} Requested".format(
+                    len(self.requested)))
+                min_val = time.time()
+                next_key = None
+                next_item = None
+                for key in self.requested:
+                    if self.requested[key]['date'] < min_val:
+                        next_item = self.requested[key]
+                        next_key = key
+                        min_val = self.requested[key]['date']
+                print next_item
+                time_until_next_item = config.EXPIRE - (
+                        time.time() - next_item['date'])
+                message = "The next item: {} in {} s".format(
+                        pformat({next_key: next_item}), time_until_next_item)
+                connection.privmsg(source, message)
         else:
             print event.arguments()[0].startswith('.')
             print config.admin
@@ -79,71 +193,81 @@ class dccBot(irclib.SimpleIRCClient):
     def on_pubmsg(self, connection, event):
         line = event.arguments()[0]
         list_position = line.lower().find('list')
-        if list_position > -1:
-            # print 'found list word'
-            for word in line.split():
-                if '@' in word:
-                    word = filter(lambda x: x in string.letters or x in ['@'], word)
-                    if word.startswith("@") and word not in config.blacklist:
-                        # print 'found trigger word'
-                        #if we have not seen this trigger before add it to our list
-                        if word not in self.seen:
-                            self.seen.update(self.make_entry(event, word))
-                            #if we have not requested this trigger before, and
-                            #enough time has elapsed since the last request, or the
-                            # last request is too far back, request it
-                            if self.may_trigger_next(word):
-                                # if word in self.requested:
-                                    # print "Last update {}".\
-                                    #         format(time.time() - EXPIRE
-                                    #         - self.requested[word]['date'])
-                                self.last_request = time.time()
-                                print "Sending trigger '{}' to '{}'".format(word,
-                                    event.target())
-                                connection.privmsg(event.target(), word)
-                                self.requested.update(self.make_entry(event, word))
-                                self.persist['requested'] = self.requested
-                                self.persist.sync()
-                                # print "Persisted request {}".format(self.requested)
-                            else:
-                                # print time.time()-self.last_request > HAMMER_TIME
-                                # print word not in self.requested
-                                # if word in self.requested:
-                                #     print(time.time() - EXPIRE - self.requested[word]['date'])
-                                self.waiting.update(self.make_entry(event, word))
-                                print "\tQueing trigger {}: {}".format(word, self.waiting)
-                                # print self.waiting
-                        # else:
-                        #     print "but i've seen it before"
-                    else:
-                        unmatched_word = open('unmatched.txt', 'a')
-                        unmatched_word.write("{}\n".format(word))
-                        unmatched_word.close()
 
+        if line.startswith('.'):
+            if event.arguments()[0] == '.motd':
+                if config.motd and self.motd_counter == 0:
+                    message = subprocess.Popen('/usr/games/fortune',
+                            stdout=subprocess.PIPE).communicate()
+                    source = event.target()
+                    connection.privmsg(
+                            source, "{}".format(
+                                str(message[0]).replace('\n', ' ')))
+                    self.motd_counter = (
+                            (self.motd_counter + 1) % config.MOTD_FREQUENCY)
         else:
-            # print "not list advert, waiting has length of {}".format(len(self.waiting))
-            # print time.time() - self.last_request - HAMMER_TIME
-            if self.may_trigger_next():  # Test for hammer time
-                # print self.waiting
-                if len(self.waiting) > 0:
-                    entry = self.waiting.popitem()
-                    # print entry
-                    # print(entry[1]['target'], entry[0])
-                    if self.may_trigger_next(entry[0]):  # Test for expiry
-                        print "Sending trigger '{}' to '{}'".format(entry[0],
-                            entry[1])
-                        connection.privmsg(entry[1]['target'], entry[0])
-                        self.last_request = time.time()
-                        self.requested[entry[0]] = entry[1]
-                        # print self.waiting
-                        #Update all waiting entries with new timestamps
-                        # for entry in self.waiting.keys():
-                        #     self.waiting[entry]['date'] = time.time()
-                        # print self.waiting
-                        self.persist['requested'] = self.requested
-                        self.persist.sync()
-                        # print "Persisted request {}".format(self.requested)
-            #print event.target() + '> ' + event.source().split('!')[0] + ': ' + event.arguments()[0]
+            if list_position > -1:
+                for word in line.split():
+                    if '@' in word:
+                        word = filter(
+                                lambda x: x in string.letters or x in ['@'],
+                                word)
+                        if(word.startswith("@")
+                                and word not in config.blacklist):
+                            # if we have not seen this trigger before add it to
+                            # our list
+                            if word not in self.seen:
+                                self.seen.update(self.make_entry(event, word))
+                                # if we have not requested this trigger before,
+                                # and enough time has elapsed since the last
+                                # request, or the last request is too far back,
+                                # request it
+                                if self.may_trigger_next(word):
+                                    self.last_request = time.time()
+                                    print "Sending trigger '{}' to '{}'".\
+                                            format(word, event.target())
+                                    connection.privmsg(event.target(), word)
+                                    self.requested.update(
+                                            self.make_entry(event, word))
+                                    self.persist['requested'] = self.requested
+                                    self.persist.sync()
+                                else:
+                                    self.waiting.update(self.make_entry(event, word))
+                                    print "\tQueing trigger {}: {}".format(word, self.waiting)
+                        else:
+                            unmatched_word = open('unmatched.txt', 'a')
+                            unmatched_word.write("{}\n".format(word))
+                            unmatched_word.close()
+                    else:
+                        if 'shutup' in word or 'shaddap' in word:
+                            print "sending sock to {}".format(event.target())
+                            connection.privmsg(
+                                    event.target(), "Yes, put a sock in it!")
+
+            else:
+                # print "not list advert, waiting has length of {}".format(len(self.waiting))
+                # print time.time() - self.last_request - HAMMER_TIME
+                if self.may_trigger_next():  # Test for hammer time
+                    # print self.waiting
+                    if len(self.waiting) > 0:
+                        entry = self.waiting.popitem()
+                        # print entry
+                        # print(entry[1]['target'], entry[0])
+                        if self.may_trigger_next(entry[0]):  # Test for expiry
+                            print "Sending trigger '{}' to '{}'".format(entry[0],
+                                entry[1])
+                            connection.privmsg(entry[1]['target'], entry[0])
+                            self.last_request = time.time()
+                            self.requested[entry[0]] = entry[1]
+                            # print self.waiting
+                            #Update all waiting entries with new timestamps
+                            # for entry in self.waiting.keys():
+                            #     self.waiting[entry]['date'] = time.time()
+                            # print self.waiting
+                            self.persist['requested'] = self.requested
+                            self.persist.sync()
+                            # print "Persisted request {}".format(self.requested)
+                #print event.target() + '> ' + event.source().split('!')[0] + ': ' + event.arguments()[0]
 
     def may_trigger_next(self, word=None):
         not_hammering = time.time() - self.last_request > config.HAMMER_TIME
