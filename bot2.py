@@ -37,6 +37,8 @@ class dccBot(irclib.SimpleIRCClient):
         self.skip_song_votes = []
         self.player = None
         self.queue = collections.deque()
+        self.total_count = 0
+        self.votes = 0
 
     def on_privnotice(self, connection, event):
         if event.source():
@@ -71,11 +73,19 @@ class dccBot(irclib.SimpleIRCClient):
                 for line in self.music_files:
                     if line.find(search_term) > -1:
                         self.connection.privmsg(source, os.path.basename(line))
-                        time.sleep(1)
+                        time.sleep(config.spam_delay)
             else:
                 self.connection.privmsg(source, 'Syntax: .ls <search term>')
         else:
             self.connection.privmsg(source, 'List empty')
+
+    def match_count(self, search_term):
+        # TODO Cache the first hit to speed up find_first_result calls
+        count = 0
+        for line in self.music_files:
+            if line.find(search_term) > -1:
+                count += 1
+        return count
 
     def find_first_result(self, search_term):
         for line in self.music_files:
@@ -87,10 +97,15 @@ class dccBot(irclib.SimpleIRCClient):
         item_to_queue = ' '.join(event.arguments()[0].split(' ')[1:])
         if len(item_to_queue) > 0:
             if len(self.music_files) > 0:
-                filepath = self.find_first_result(item_to_queue)
-                self.play(filepath)
+                if self.match_count(item_to_queue) > 1:
+                    self.connection.privmsg(source, 'More than one match')
+                    self.ls_handler(event)
+                else:
+                    filepath = self.find_first_result(item_to_queue)
+                    self.play(filepath)
             else:
-                self.connection.privmsg(source, 'The list is empty. Try a refresh')
+                self.connection.privmsg(
+                        source, 'The list is empty. Try a .refresh')
         else:
             self.show_queue_handler(event)
 
@@ -102,9 +117,11 @@ class dccBot(irclib.SimpleIRCClient):
             ctr = 0
             for item in self.queue:
                 ctr += 1
-                self.connection.privmsg(source, "{}:{}".format(ctr, os.path.basename(item)))
+                self.connection.privmsg(
+                        source, "{}:{}".format(ctr, os.path.basename(item)))
         else:
-            self.connection.privmsg(source, 'The queue is empty. Better act fast!')
+            self.connection.privmsg(
+                    source, 'The queue is empty. Better act fast!')
 
     def play(self, filepath):
         if not self.player or self.player.returncode:
@@ -117,28 +134,61 @@ class dccBot(irclib.SimpleIRCClient):
                 print filepath
                 for _ in range(1, 9):
                     print "SOMETHING VERY BAD HAPPENED"
-                    print filepath
         else:
             #something is playing TODO queue for next play
             self.queue.append(filepath)
 
     def next_handler(self, event):
+        #TODO check if we are playing anything
         #Add this person to the list of people wanting to skip this song
         source = event.source().split('!')[0]
         self.skip_song_votes.append(source)
-        #TODO Use a system of majority to skip a currently playing song
+        self.connection.names()
+        self.connection.privmsg(source, 'I counted your vote')
 
     def stop_handler(self, event):
-        self.player.send_signal(signal.SIGTERM)
+        if self.player:
+            self.player.send_signal(signal.SIGTERM)
+            self.player = None
 
     def continue_handler(self, event):
         print self.player
         print self.player.returncode
-        self.play(self.queue.pop())
+        if len(self.queue) > 0:
+            self.play(self.queue.pop())
+        else:
+            source = event.source().split('!')[0]
+            self.connection.privmsg(source, 'Queue is empty')
 
     def help_handler(self, event):
         source = event.source().split('!')[0]
-        self.connection.privmsg(source, '.h, .leave, .ls, .refresh, .q, .queue, .n, .s, .c')
+        self.connection.privmsg(
+                source, '.h, .leave, .ls, .refresh, .q, .queue, .n, .s, .c')
+
+    def on_endofnames(self, connection, event):
+        self.votes = len(self.skip_song_votes)
+        self.check_skip_requirements(connection, event)
+
+    def check_skip_requirements(self, connection, event):
+        if (self.votes * 1.0 / self.total_count) >= 0.5:
+            self.stop_handler(event)
+            if len(self.queue) > 0:
+                self.play(self.queue.pop())
+                self.connection.privmsg(
+                        config.channel, 'Song voted out. Playing next one')
+            else:
+                self.connection.privmsg(
+                        config.channel, 'Song voted out. Queue empty.')
+        else:
+            self.connection.privmsg(
+                    config.channel,
+                    '{} votes for skipping this song. Need {} more.'.format(
+                        self.votes, ((self.total_count / 2) - self.votes)))
+
+    def on_namreply(self, connection, event):
+        self.total_count = len(event.arguments()[2].split(' ')) - 1
+        self.votes = len(self.skip_song_votes)
+        self.check_skip_requirements(connection, event)
 
     def on_privmsg(self, connection, event):
         source = event.source().split('!')[0]
@@ -164,8 +214,10 @@ class dccBot(irclib.SimpleIRCClient):
                 message = "We are waiting to retrieve these:\n{}".format(
                     pformat(self.waiting))
                 print message
-                connection.privmsg(source, "{} Waiting".format(len(self.waiting)))
-                message = "List of requests:\n{}".format(pformat(self.requested))
+                connection.privmsg(
+                        source, "{} Waiting".format(len(self.waiting)))
+                message = "List of requests:\n{}".format(
+                        pformat(self.requested))
                 print message
                 connection.privmsg(source, "{} Requested".format(
                     len(self.requested)))
@@ -232,8 +284,10 @@ class dccBot(irclib.SimpleIRCClient):
                                     self.persist['requested'] = self.requested
                                     self.persist.sync()
                                 else:
-                                    self.waiting.update(self.make_entry(event, word))
-                                    print "\tQueing trigger {}: {}".format(word, self.waiting)
+                                    self.waiting.update(
+                                            self.make_entry(event, word))
+                                    print "\tQueing trigger {}: {}".format(
+                                            word, self.waiting)
                         else:
                             unmatched_word = open('unmatched.txt', 'a')
                             unmatched_word.write("{}\n".format(word))
@@ -245,7 +299,6 @@ class dccBot(irclib.SimpleIRCClient):
                                     event.target(), "Yes, put a sock in it!")
 
             else:
-                # print "not list advert, waiting has length of {}".format(len(self.waiting))
                 # print time.time() - self.last_request - HAMMER_TIME
                 if self.may_trigger_next():  # Test for hammer time
                     # print self.waiting
@@ -254,8 +307,8 @@ class dccBot(irclib.SimpleIRCClient):
                         # print entry
                         # print(entry[1]['target'], entry[0])
                         if self.may_trigger_next(entry[0]):  # Test for expiry
-                            print "Sending trigger '{}' to '{}'".format(entry[0],
-                                entry[1])
+                            print "Sending trigger '{}' to '{}'".format(
+                                    entry[0], entry[1])
                             connection.privmsg(entry[1]['target'], entry[0])
                             self.last_request = time.time()
                             self.requested[entry[0]] = entry[1]
@@ -266,8 +319,6 @@ class dccBot(irclib.SimpleIRCClient):
                             # print self.waiting
                             self.persist['requested'] = self.requested
                             self.persist.sync()
-                            # print "Persisted request {}".format(self.requested)
-                #print event.target() + '> ' + event.source().split('!')[0] + ': ' + event.arguments()[0]
 
     def may_trigger_next(self, word=None):
         not_hammering = time.time() - self.last_request > config.HAMMER_TIME
@@ -294,7 +345,6 @@ class dccBot(irclib.SimpleIRCClient):
             return
         print "\tCTCP ", event.source(), event.arguments()
         filename = os.path.basename(" ".join(args[1:-3]))
-        # print "Receiving {} from {}".format(filename, event.source().split('!')[0])
         if os.path.exists(filename):
             print "\tA file named", filename, "already exists. Renaming it."
             newname = filename
@@ -316,7 +366,6 @@ class dccBot(irclib.SimpleIRCClient):
         peeraddress = irclib.ip_numstr_to_quad(args[-3])
         peerport = int(args[-2])
         dcc = self.dcc_connect(peeraddress, peerport, "raw")
-        # print "New DCC connection to {}:{} at {}".format(peeraddress, port, dcc)
         if peeraddress not in self.file_list:
             file_obj = open(filename, "wb")
             self.file_list[peeraddress] = {
@@ -375,6 +424,7 @@ class dccBot(irclib.SimpleIRCClient):
 def main():
     connection = dccBot()
     try:
+        connection.refresh_handler(None)
         connection.connect(config.network, config.port, config.nick)
     except irclib.ServerConnectionError,  x:
         print x
